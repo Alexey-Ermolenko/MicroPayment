@@ -1,0 +1,181 @@
+# MicroPayment
+
+Учебный эмулятор платёжного процессора. Демонстрирует REST API, событийную
+архитектуру на Kafka, транзакции PostgreSQL, идемпотентность через Redis и
+балансировку нагрузки за Nginx.
+
+## Стек
+```
+PHP 8.4
+Symfony 7
+PostgreSQL 16
+Redis 7
+Apache Kafka (KRaft)
+Nginx
+Docker Compose
+LexikJWT
+Symfony Messenger
+PHPUnit
+```
+## Процессинг
+Операции асинхронны: HTTP-запрос публикует команду в Kafka и сразу
+отвечает `202` со сгенерированным `id`. Воркер потребляет команду, пишет строку
+`transaction` в статусе `PENDING`, затем админ проводит (`approve`) или блокирует
+(`block`) её — тоже через очередь. Деньги списываются/зачисляются только при
+`approve`, в одной транзакции PostgreSQL — кошельки на это время блокируются, 
+поэтому параллельные операции не мешают друг другу.
+После изменения статуса воркер публикует доменное событие в Kafka, которое
+асинхронно обрабатывают consumer'ы (уведомления, аудит).
+
+## Запуск
+
+```bash
+cp .env.example .env   # заполнить APP_SECRET и JWT_PASSPHRASE
+docker compose up -d --build
+```
+
+Поднимаются: `postgres`, `redis`, `kafka`, `app1`, `app2`, `worker`, `nginx`.
+Миграции применяются автоматически (контейнер `app1`), JWT-ключи запекаются в
+образ. API доступен на `http://localhost:8080`.
+
+Swagger UI: `http://localhost:8080/api/doc`
+
+## Деньги
+
+Хранятся в минимальных единицах (центах), тип `bigint`. `amount: 5000` = 50.00.
+
+## Redis
+
+Используется под идемпотентность создания транзакций. Пул `idempotency.cache`
+(TTL 24 часа) хранит связку `Idempotency-Key -> id транзакции`: повторный запрос
+`deposit`/`withdraw`/`transfer` с тем же ключом возвращает уже созданный id вместо
+второй транзакции (`IdempotencyService`). В тестах Redis подменяется array-кэшем.
+
+## Сценарий (curl)
+
+Плейсхолдеры `{{token}}`, `{{wallet}}`, `{{other}}`, `{{tx}}` подставить из ответов.
+
+```bash
+# 1. Регистрация (role по умолчанию ROLE_USER)
+curl -X POST http://localhost:8080/api/v1/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice3@example.com","password":"secret123","role":"ROLE_USER"}'
+
+# 2. Регистрация админа (нужен для approve/block) -> {{admin_token}} через логин
+curl -X POST http://localhost:8080/api/v1/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"admin2@example.com","password":"secret123","role":"ROLE_ADMIN"}'
+
+# 3. Логин -> JWT (поле "token" в ответе)
+curl -X POST http://localhost:8080/api/v1/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com","password":"secret123"}'
+
+# 4. Кошелёк (создать два: отправитель и получатель; "id" в ответе)
+curl -X POST http://localhost:8080/api/v1/wallets \
+  -H 'Authorization: Bearer {{token}}' \
+  -H 'Content-Type: application/json' \
+  -d '{"currency":"USD"}'
+
+# 5. Пополнение — 202 + "id" транзакции (Idempotency-Key защищает от дублей)
+curl -X POST http://localhost:8080/api/v1/transactions/deposit \
+  -H 'Authorization: Bearer {{token}}' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: dep-1' \
+  -d '{"walletId":"{{wallet}}","amount":10000}'
+
+# 6. Апрув админом — воркер зачисляет средства. Нужен токен с ROLE_ADMIN.
+curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/approve \
+  -H 'Authorization: Bearer {{admin_token}}'
+
+# 7. Статус транзакции — PENDING -> APPROVED / FAILED / BLOCKED
+curl -X GET http://localhost:8080/api/v1/transactions/{{tx}} \
+  -H 'Authorization: Bearer {{token}}'
+
+# 8. Баланс (после обработки воркером)
+curl -X GET http://localhost:8080/api/v1/wallets/{{wallet}} \
+  -H 'Authorization: Bearer {{token}}'
+
+# 9. Перевод — 202 + "id" транзакции в PENDING
+curl -X POST http://localhost:8080/api/v1/transactions/transfer \
+  -H 'Authorization: Bearer {{token}}' \
+  -H 'Content-Type: application/json' \
+  -d '{"senderWalletId":"{{wallet}}","recipientWalletId":"{{other}}","amount":3000}'
+
+# 10. Апрув перевода админом
+curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/approve \
+  -H 'Authorization: Bearer {{admin_token}}'
+
+# 11. Либо блокировка админом вместо апрува -> BLOCKED (деньги не двигаются)
+curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/block \
+  -H 'Authorization: Bearer {{admin_token}}'
+
+# 12. Возврат — инициирует владелец кошелька (создаёт REFUND в PENDING, апрувит админ)
+curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/refund \
+  -H 'Authorization: Bearer {{token}}'
+
+# 13. Профиль — текущий пользователь и его транзакции
+curl http://localhost:8080/api/v1/profile \
+  -H 'Authorization: Bearer {{token}}'
+```
+
+## Эндпоинты
+
+| Метод | Путь | Описание |
+|-------|------|----------|
+| POST | `/api/v1/register` | регистрация |
+| POST | `/api/v1/login` | получить JWT |
+| GET | `/api/v1/profile` | текущий пользователь + его транзакции |
+| POST | `/api/v1/wallets` | создать кошелёк |
+| GET | `/api/v1/wallets/{id}` | баланс |
+| POST | `/api/v1/transactions/deposit` | пополнение → `202`, `PENDING` |
+| POST | `/api/v1/transactions/withdraw` | вывод → `202`, `PENDING` |
+| POST | `/api/v1/transactions/transfer` | перевод → `202`, `PENDING` |
+| POST | `/api/v1/transactions/{id}/refund` | возврат (владелец) → `202`, `PENDING` |
+| POST | `/api/v1/transactions/{id}/approve` | **ROLE_ADMIN**: провести → `APPROVED` |
+| POST | `/api/v1/transactions/{id}/block` | **ROLE_ADMIN**: заблокировать → `BLOCKED` |
+| GET | `/api/v1/transactions/{id}` | статус транзакции |
+| GET | `/api/v1/stats` | статистика |
+
+Все операции асинхронны: любой из `deposit`/`withdraw`/`transfer`/`refund` публикует
+команду в Kafka и возвращает `202` с `id`. Воркер создаёт транзакцию в `PENDING`; деньги
+двигаются только после `approve` админом. `GET /api/v1/transactions/{id}` вернёт `404`, пока
+воркер не обработал команду. `refund` инициирует владелец кошелька, `approve`/`block` —
+только `ROLE_ADMIN`.
+
+Эндпоинты создания принимают заголовок `Idempotency-Key` — повторный запрос с тем же
+ключом не создаёт вторую транзакцию.
+
+Роль задаётся при регистрации необязательным полем `role` (`ROLE_USER` по умолчанию или
+`ROLE_ADMIN`): `POST /api/v1/register {"email":"...","password":"...","role":"ROLE_ADMIN"}`.
+
+## Consumer'ы
+
+Воркер `worker` запускает `messenger:consume events_kafka` и обрабатывает события
+двумя хендлерами: уведомления и аудит.
+
+```bash
+make consume # запустить consumer вручную
+```
+
+## Тесты
+
+```bash
+make test # docker compose exec app1 php bin/phpunit
+```
+
+Гоняются внутри контейнера `app1` на отдельной БД `app_test` (Postgres); Kafka
+заменена sync-транспортом Messenger (команды и события исполняются inline), Redis —
+array-кэшем.
+
+## Деплой
+
+Простой деплой по SSH на сервере выполняется `git pull` и пересборка стека.
+
+```bash
+# один раз: склонировать репозиторий на сервер
+git clone <origin-url> /www/micropayment
+cp .env.example .env    # заполнить APP_SECRET и JWT_PASSPHRASE
+# каждый релиз: выкатить main на сервер
+make deploy
+```

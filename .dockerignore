@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+var/
+vendor/
+config/jwt/
+.env.local
+.env.*.local
+docker-compose.override.yml
+*.md
+MiniPay.docx
+MiniPay.pdf
