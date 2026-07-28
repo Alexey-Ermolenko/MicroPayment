@@ -86,7 +86,7 @@ services:
     build:
       context: .
       dockerfile: docker/php/Dockerfile
-    command: php bin/console messenger:consume events_kafka -vv --time-limit=3600
+    command: php bin/console messenger:consume events_kafka scheduler_default -vv --time-limit=3600
     env_file: .env
     restart: unless-stopped
     volumes:

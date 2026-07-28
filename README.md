@@ -47,7 +47,7 @@ Swagger UI: `http://localhost:8080/api/doc`
 ## Redis
 
 Используется под идемпотентность создания транзакций. Пул `idempotency.cache`
-(TTL 24 часа) хранит связку `Idempotency-Key -> id транзакции`: повторный запрос
+(TTL 3 суток) хранит связку `Idempotency-Key -> id транзакции`: повторный запрос
 `deposit`/`withdraw`/`transfer` с тем же ключом возвращает уже созданный id вместо
 второй транзакции (`IdempotencyService`). В тестах Redis подменяется array-кэшем.
 
@@ -96,25 +96,37 @@ curl -X GET http://localhost:8080/api/v1/transactions/{{tx}} \
 curl -X GET http://localhost:8080/api/v1/wallets/{{wallet}} \
   -H 'Authorization: Bearer {{token}}'
 
-# 9. Перевод — 202 + "id" транзакции в PENDING
-curl -X POST http://localhost:8080/api/v1/transactions/transfer \
+# 9. Вывод — 202 + "id" транзакции в PENDING (списание тоже только после approve)
+curl -X POST http://localhost:8080/api/v1/transactions/withdraw \
   -H 'Authorization: Bearer {{token}}' \
   -H 'Content-Type: application/json' \
-  -d '{"senderWalletId":"{{wallet}}","recipientWalletId":"{{other}}","amount":3000}'
+  -H 'Idempotency-Key: wd-1' \
+  -d '{"walletId":"{{wallet}}","amount":2500}'
 
-# 10. Апрув перевода админом
+# 10. Апрув вывода админом -> средства списываются
 curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/approve \
   -H 'Authorization: Bearer {{admin_token}}'
 
-# 11. Либо блокировка админом вместо апрува -> BLOCKED (деньги не двигаются)
+# 11. Перевод — 202 + "id" транзакции в PENDING
+curl -X POST http://localhost:8080/api/v1/transactions/transfer \
+  -H 'Authorization: Bearer {{token}}' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: tr-1' \
+  -d '{"senderWalletId":"{{wallet}}","recipientWalletId":"{{other}}","amount":3000}'
+
+# 12. Апрув перевода админом
+curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/approve \
+  -H 'Authorization: Bearer {{admin_token}}'
+
+# 13. Либо блокировка админом вместо апрува -> BLOCKED (деньги не двигаются)
 curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/block \
   -H 'Authorization: Bearer {{admin_token}}'
 
-# 12. Возврат — инициирует владелец кошелька (создаёт REFUND в PENDING, апрувит админ)
+# 14. Возврат — инициирует владелец кошелька (создаёт REFUND в PENDING, апрувит админ)
 curl -X POST http://localhost:8080/api/v1/transactions/{{tx}}/refund \
   -H 'Authorization: Bearer {{token}}'
 
-# 13. Профиль — текущий пользователь и его транзакции
+# 15. Профиль — текущий пользователь и его транзакции
 curl http://localhost:8080/api/v1/profile \
   -H 'Authorization: Bearer {{token}}'
 ```
@@ -146,16 +158,23 @@ curl http://localhost:8080/api/v1/profile \
 Эндпоинты создания принимают заголовок `Idempotency-Key` — повторный запрос с тем же
 ключом не создаёт вторую транзакцию.
 
+Транзакция, которую за 3 суток никто не провёл и не заблокировал, блокируется
+автоматически: раз в час планировщик (`symfony/scheduler`) отправляет команду
+`BlockTransaction` по тем же рельсам, что и админский `block`, поэтому уведомление и
+запись в аудит появляются как обычно. Вручную: `make expire`.
+
 Роль задаётся при регистрации необязательным полем `role` (`ROLE_USER` по умолчанию или
 `ROLE_ADMIN`): `POST /api/v1/register {"email":"...","password":"...","role":"ROLE_ADMIN"}`.
 
 ## Consumer'ы
 
-Воркер `worker` запускает `messenger:consume events_kafka` и обрабатывает события
-двумя хендлерами: уведомления и аудит.
+Воркер `worker` запускает `messenger:consume events_kafka scheduler_default` и обрабатывает
+события двумя хендлерами: уведомления и аудит. Второй транспорт — планировщик: раз в час он
+выдаёт сообщение `ExpirePendingTransactions`, которое блокирует просроченные транзакции.
 
 ```bash
 make consume # запустить consumer вручную
+make expire  # блокировать висячие PENDING сейчас
 ```
 
 ## Тесты

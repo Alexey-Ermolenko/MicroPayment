@@ -4,6 +4,8 @@ namespace App\Repository;
 
 use App\Entity\Transaction;
 use App\Entity\User;
+use App\Enum\TransactionStatus;
+use DateTimeImmutable;
 use Doctrine\Bundle\DoctrineBundle\Repository\ServiceEntityRepository;
 use Doctrine\Persistence\ManagerRegistry;
 
@@ -25,6 +27,22 @@ class TransactionRepository extends ServiceEntityRepository
     public function findOneRefundOf(Transaction $original): ?Transaction
     {
         return $this->findOneBy(['refundedTransaction' => $original]);
+    }
+
+    /**
+     * @return Transaction[]
+     */
+    public function findPendingOlderThan(DateTimeImmutable $threshold, int $limit = 500): array
+    {
+        return $this->createQueryBuilder('t')
+            ->where('t.status = :pending')
+            ->andWhere('t.createdAt < :threshold')
+            ->setParameter('pending', TransactionStatus::PENDING)
+            ->setParameter('threshold', $threshold)
+            ->orderBy('t.createdAt', 'ASC')
+            ->setMaxResults($limit)
+            ->getQuery()
+            ->getResult();
     }
 
     /**

@@ -18,6 +18,9 @@ migrate: ## Run database migrations
 consume: ## Run a Kafka consumer (handlers) in the foreground
 	docker compose exec app1 php bin/console messenger:consume events_kafka -vv
 
+expire: ## Block transactions stuck in PENDING for too long
+	docker compose exec app1 php bin/console app:transactions:expire
+
 test: ## Run the test suite
 	docker compose exec app1 php bin/phpunit
 

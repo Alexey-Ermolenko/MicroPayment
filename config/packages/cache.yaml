@@ -7,7 +7,7 @@ framework:
             # Dedicated pool backed by Redis (idempotency keys).
             idempotency.cache:
                 adapter: cache.app
-                default_lifetime: 86400
+                default_lifetime: 259200 # 3 days
 
 when@test:
     framework:
