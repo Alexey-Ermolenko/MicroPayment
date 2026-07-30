@@ -3,8 +3,12 @@
 # Pulls the merged main, rebuilds the stack and applies migrations.
 set -euo pipefail
 
-# .env is gitignored: create it from the example on the first deploy.
-[ -f .env ] || cp .env.example .env
+# .env is gitignored and must be provisioned on the server: copying the example would boot
+# production in dev mode with predictable secrets.
+if [ ! -f .env ]; then
+    echo "ERROR: .env is missing. Create it from .env.example with APP_ENV=prod and real secrets." >&2
+    exit 1
+fi
 
 echo "==> Updating main"
 git checkout main

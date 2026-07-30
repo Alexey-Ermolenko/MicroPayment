@@ -18,7 +18,7 @@ use App\Message\CreateTransaction;
 use App\Repository\TransactionRepository;
 use App\Repository\WalletRepository;
 use App\Service\IdempotencyService;
-use Psr\Cache\InvalidArgumentException;
+use RedisException;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
@@ -28,10 +28,14 @@ use Symfony\Component\Messenger\Exception\ExceptionInterface;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Uid\Uuid;
+use Throwable;
 
 #[Route('/api/v1/transactions')]
 final class TransactionController extends AbstractController
 {
+    /** Keeps the user-scoped key within the idempotency_key column (uuid + separator + key). */
+    private const int IDEMPOTENCY_KEY_MAX_LENGTH = 64;
+
     public function __construct(
         private readonly MessageBusInterface $commandBus,
         private readonly WalletRepository $wallets,
@@ -41,8 +45,9 @@ final class TransactionController extends AbstractController
     }
 
     /**
-     * @throws InvalidArgumentException
+     * @throws RedisException
      * @throws ExceptionInterface
+     * @throws Throwable
      */
     #[Route('/deposit', methods: ['POST'])]
     public function deposit(#[MapRequestPayload] DepositRequest $request, Request $http): JsonResponse
@@ -53,8 +58,9 @@ final class TransactionController extends AbstractController
     }
 
     /**
-     * @throws InvalidArgumentException
+     * @throws RedisException
      * @throws ExceptionInterface
+     * @throws Throwable
      */
     #[Route('/withdraw', methods: ['POST'])]
     public function withdraw(#[MapRequestPayload] WithdrawRequest $request, Request $http): JsonResponse
@@ -66,7 +72,8 @@ final class TransactionController extends AbstractController
 
     /**
      * @throws ExceptionInterface
-     * @throws InvalidArgumentException
+     * @throws RedisException
+     * @throws Throwable
      */
     #[Route('/transfer', methods: ['POST'])]
     public function transfer(#[MapRequestPayload] TransferRequest $request, Request $http): JsonResponse
@@ -75,6 +82,9 @@ final class TransactionController extends AbstractController
         $recipient = $this->wallets->find($request->recipientWalletId)
             ?? throw $this->createNotFoundException('Recipient wallet not found.');
 
+        if ($sender->getId()->equals($recipient->getId())) {
+            throw new InvalidTransactionException('Sender and recipient wallets must differ.');
+        }
         if ($sender->getCurrency() !== $recipient->getCurrency()) {
             throw new InvalidTransactionException('Currency mismatch between wallets.');
         }
@@ -121,7 +131,7 @@ final class TransactionController extends AbstractController
     public function approve(Transaction $transaction): JsonResponse
     {
         $this->denyAccessUnlessGranted('ROLE_ADMIN');
-        $this->commandBus->dispatch(new ApproveTransaction((string) $transaction->getId()));
+        $this->commandBus->dispatch(new ApproveTransaction((string) $transaction->getId(), (string) $this->currentUser()->getId()));
 
         return $this->accepted($transaction->getId());
     }
@@ -133,7 +143,7 @@ final class TransactionController extends AbstractController
     public function block(Transaction $transaction): JsonResponse
     {
         $this->denyAccessUnlessGranted('ROLE_ADMIN');
-        $this->commandBus->dispatch(new BlockTransaction((string) $transaction->getId()));
+        $this->commandBus->dispatch(new BlockTransaction((string) $transaction->getId(), (string) $this->currentUser()->getId()));
 
         return $this->accepted($transaction->getId());
     }
@@ -160,7 +170,8 @@ final class TransactionController extends AbstractController
 
     /**
      * @throws ExceptionInterface
-     * @throws InvalidArgumentException
+     * @throws RedisException
+     * @throws Throwable
      */
     private function create(
         TransactionType $type,
@@ -168,32 +179,39 @@ final class TransactionController extends AbstractController
         string $currency,
         ?Wallet $sender,
         ?Wallet $recipient,
-        ?string $idempotencyKey
+        string $idempotencyKey
     ): JsonResponse {
-        if ($idempotencyKey !== null) {
-            $existingId = $this->idempotency->get($idempotencyKey)
-                ?? $this->transactions->findOneByIdempotencyKey($idempotencyKey)?->getId()?->toRfc4122();
-            if (null !== $existingId) {
-                return $this->accepted(Uuid::fromString($existingId));
-            }
+        // Covers a repeat that arrives after the Redis claim expired but the transaction still exists.
+        $existing = $this->transactions->findOneByIdempotencyKey($idempotencyKey);
+        if (null !== $existing) {
+            return $this->accepted($existing->getId());
         }
 
         $id = Uuid::v4();
-        if ($idempotencyKey !== null) {
-            $this->idempotency->store($idempotencyKey, (string) $id);
+        $reservedId = $this->idempotency->reserve($idempotencyKey, (string) $id);
+        if ($reservedId !== (string) $id) {
+            // A parallel request with the same key won the claim: answer with its transaction id.
+            return $this->accepted(Uuid::fromString($reservedId));
         }
 
-        $this->commandBus->dispatch(
-            new CreateTransaction(
-                transactionId: (string) $id,
-                type: $type->value,
-                amount: $amount,
-                currency: $currency,
-                senderWalletId: null !== $sender ? (string) $sender->getId() : null,
-                recipientWalletId: null !== $recipient ? (string) $recipient->getId() : null,
-                idempotencyKey: $idempotencyKey,
-            ),
-        );
+        try {
+            $this->commandBus->dispatch(
+                new CreateTransaction(
+                    transactionId: (string) $id,
+                    type: $type->value,
+                    amount: $amount,
+                    currency: $currency,
+                    senderWalletId: null !== $sender ? (string) $sender->getId() : null,
+                    recipientWalletId: null !== $recipient ? (string) $recipient->getId() : null,
+                    idempotencyKey: $idempotencyKey,
+                ),
+            );
+        } catch (Throwable $e) {
+            // The command never reached Kafka: free the key instead of pointing it at a phantom id.
+            $this->idempotency->release($idempotencyKey);
+
+            throw $e;
+        }
 
         return $this->accepted($id);
     }
@@ -233,13 +251,20 @@ final class TransactionController extends AbstractController
         return $user;
     }
 
+    /**
+     * Returns the key scoped to the current user: the same header value from two users must not collide,
+     * neither in Redis nor in the unique idempotency_key index.
+     */
     private function idempotencyKey(Request $request): string
     {
         $key = trim((string) $request->headers->get('Idempotency-Key'));
         if ('' === $key) {
             throw new BadRequestHttpException('Idempotency-Key header is required.');
         }
+        if (mb_strlen($key) > self::IDEMPOTENCY_KEY_MAX_LENGTH) {
+            throw new BadRequestHttpException(sprintf('Idempotency-Key must not exceed %d characters.', self::IDEMPOTENCY_KEY_MAX_LENGTH));
+        }
 
-        return $key;
+        return sprintf('%s:%s', $this->currentUser()->getId(), $key);
     }
 }

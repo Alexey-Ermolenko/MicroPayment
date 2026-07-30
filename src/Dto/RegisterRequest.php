@@ -14,9 +14,6 @@ final class RegisterRequest
         #[Assert\NotBlank]
         #[Assert\Length(min: 6)]
         public string $password = '',
-
-        #[Assert\Choice(choices: ['ROLE_USER', 'ROLE_ADMIN'])]
-        public string $role = 'ROLE_USER',
     ) {
     }
 }

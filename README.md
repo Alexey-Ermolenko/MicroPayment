@@ -27,6 +27,11 @@ PHPUnit
 После изменения статуса воркер публикует доменное событие в Kafka, которое
 асинхронно обрабатывают consumer'ы (уведомления, аудит).
 
+Доставка at-least-once: авто-коммит оффсетов выключен, оффсет двигается только в
+`ack()`/`reject()` транспорта (`KafkaTransport`), то есть после того как хендлер
+отработал либо Messenger исчерпал ретраи и увёл сообщение в failed-транспорт.
+Падение воркера посреди обработки означает повторную выдачу сообщения, а не потерю.
+
 ## Запуск
 
 ```bash
@@ -46,25 +51,32 @@ Swagger UI: `http://localhost:8080/api/doc`
 
 ## Redis
 
-Используется под идемпотентность создания транзакций. Пул `idempotency.cache`
-(TTL 3 суток) хранит связку `Idempotency-Key -> id транзакции`: повторный запрос
+Используется под идемпотентность создания транзакций. `IdempotencyService` хранит связку
+`<userId>:<Idempotency-Key> -> id транзакции` (TTL 3 суток; ключ скоупится по пользователю,
+чтобы одинаковый заголовок у разных клиентов не пересекался): повторный запрос
 `deposit`/`withdraw`/`transfer` с тем же ключом возвращает уже созданный id вместо
-второй транзакции (`IdempotencyService`). В тестах Redis подменяется array-кэшем.
+второй транзакции.
+
+Заявка на ключ делается атомарно через `SET key value NX EX` — из нескольких параллельных
+запросов с одним ключом выигрывает один, остальные получают его же id, поэтому дублей не
+возникает. Если публикация команды в Kafka не удалась, ключ освобождается (`release`), чтобы
+он не указывал на транзакцию, которой не будет. Долгоживущая страховка — уникальный индекс
+`idempotency_key` в БД: если запись в Redis уже истекла, повтор находится по нему.
 
 ## Сценарий (curl)
 
 Плейсхолдеры `{{token}}`, `{{wallet}}`, `{{other}}`, `{{tx}}` подставить из ответов.
 
 ```bash
-# 1. Регистрация (role по умолчанию ROLE_USER)
+# 1. Регистрация (всегда ROLE_USER)
 curl -X POST http://localhost:8080/api/v1/register \
   -H 'Content-Type: application/json' \
-  -d '{"email":"alice3@example.com","password":"secret123","role":"ROLE_USER"}'
+  -d '{"email":"alice3@example.com","password":"secret123"}'
 
-# 2. Регистрация админа (нужен для approve/block) -> {{admin_token}} через логин
-curl -X POST http://localhost:8080/api/v1/register \
+# 2. Логин админом (создан миграцией-сидом, см. ниже) -> {{admin_token}}
+curl -X POST http://localhost:8080/api/v1/login \
   -H 'Content-Type: application/json' \
-  -d '{"email":"admin2@example.com","password":"secret123","role":"ROLE_ADMIN"}'
+  -d '{"email":"admin@micropayment.local","password":"<ADMIN_PASSWORD>"}'
 
 # 3. Логин -> JWT (поле "token" в ответе)
 curl -X POST http://localhost:8080/api/v1/login \
@@ -147,7 +159,6 @@ curl http://localhost:8080/api/v1/profile \
 | POST | `/api/v1/transactions/{id}/approve` | **ROLE_ADMIN**: провести → `APPROVED` |
 | POST | `/api/v1/transactions/{id}/block` | **ROLE_ADMIN**: заблокировать → `BLOCKED` |
 | GET | `/api/v1/transactions/{id}` | статус транзакции |
-| GET | `/api/v1/stats` | статистика |
 
 Все операции асинхронны: любой из `deposit`/`withdraw`/`transfer`/`refund` публикует
 команду в Kafka и возвращает `202` с `id`. Воркер создаёт транзакцию в `PENDING`; деньги
@@ -163,13 +174,19 @@ curl http://localhost:8080/api/v1/profile \
 `BlockTransaction` по тем же рельсам, что и админский `block`, поэтому уведомление и
 запись в аудит появляются как обычно. Вручную: `make expire`.
 
-Роль задаётся при регистрации необязательным полем `role` (`ROLE_USER` по умолчанию или
-`ROLE_ADMIN`): `POST /api/v1/register {"email":"...","password":"...","role":"ROLE_ADMIN"}`.
+## Админ
+
+`/register` всегда создаёт `ROLE_USER` — роль админа через API получить нельзя. Единственный
+администратор создаётся миграцией-сидом (`migrations/Version20260730120000.php`): она берёт
+`ADMIN_EMAIL` и `ADMIN_PASSWORD` из окружения, проверяет наличие такого пользователя в БД и,
+если его нет, вставляет запись с `ROLE_ADMIN`. Если переменные не заданы, сид пропускается —
+админа не будет. Повышать других пользователей — вручную в БД.
 
 ## Consumer'ы
 
 Воркер `worker` запускает `messenger:consume events_kafka scheduler_default` и обрабатывает
-события двумя хендлерами: уведомления и аудит. Второй транспорт — планировщик: раз в час он
+события двумя хендлерами: уведомления и аудит (в `logs.actor` пишется id админа,
+сделавшего `approve`/`block`, либо `system` для остальных событий). Второй транспорт — планировщик: раз в час он
 выдаёт сообщение `ExpirePendingTransactions`, которое блокирует просроченные транзакции.
 
 ```bash
@@ -184,8 +201,9 @@ make test # docker compose exec app1 php bin/phpunit
 ```
 
 Гоняются внутри контейнера `app1` на отдельной БД `app_test` (Postgres); Kafka
-заменена sync-транспортом Messenger (команды и события исполняются inline), Redis —
-array-кэшем.
+заменена sync-транспортом Messenger (команды и события исполняются inline). Кэш
+приложения в тестах array, а идемпотентность работает с настоящим Redis из стека —
+атомарность `SET NX` на array-кэше не проверить.
 
 ## Деплой
 
@@ -194,7 +212,10 @@ array-кэшем.
 ```bash
 # один раз: склонировать репозиторий на сервер
 git clone <origin-url> /www/micropayment
-cp .env.example .env    # заполнить APP_SECRET и JWT_PASSPHRASE
+cp .env.example .env    # заполнить APP_SECRET, JWT_PASSPHRASE, ADMIN_*, APP_ENV=prod
 # каждый релиз: выкатить main на сервер
 make deploy
 ```
+
+`deploy.sh` сам `.env` не создаёт: если файла нет, деплой падает с ошибкой — иначе прод
+поднялся бы на дефолтах примера, то есть в dev-режиме с предсказуемыми секретами.

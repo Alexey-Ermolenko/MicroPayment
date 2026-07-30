@@ -4,7 +4,9 @@ namespace App\Message;
 
 final readonly class BlockTransaction implements Command
 {
-    public function __construct(public string $transactionId)
-    {
+    public function __construct(
+        public string $transactionId,
+        public ?string $actor = null,
+    ) {
     }
 }

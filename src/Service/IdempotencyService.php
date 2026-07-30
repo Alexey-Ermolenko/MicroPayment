@@ -2,38 +2,51 @@
 
 namespace App\Service;
 
-use Psr\Cache\CacheItemPoolInterface;
-use Psr\Cache\InvalidArgumentException;
+use Redis;
+use RedisException;
 
 /**
- * Stores Idempotency-Key -> Transaction id in Redis so a repeated request
- * returns the original transaction instead of creating a duplicate.
+ * Maps Idempotency-Key -> Transaction id in Redis so a repeated request returns the original
+ * transaction instead of creating a duplicate. The claim is atomic (SET NX), so two parallel
+ * requests with the same key cannot both win it. Keys arrive already scoped to a user
+ * (see TransactionController::idempotencyKey()).
  */
 final readonly class IdempotencyService
 {
     public function __construct(
-        private CacheItemPoolInterface $idempotencyCache,
+        private Redis $redis,
+        private int $idempotencyTtl,
     ) {
     }
 
     /**
-     * @throws InvalidArgumentException
+     * Claims the key for $transactionId and returns the id that owns it: ours, or the one a
+     * concurrent request stored first.
+     *
+     * @throws RedisException
      */
-    public function get(string $key): ?string
+    public function reserve(string $key, string $transactionId): string
     {
-        $item = $this->idempotencyCache->getItem($this->normalize($key));
+        $normalized = $this->normalize($key);
 
-        return $item->isHit() ? $item->get() : null;
+        if (true === $this->redis->set($normalized, $transactionId, ['nx', 'ex' => $this->idempotencyTtl])) {
+            return $transactionId;
+        }
+
+        $owner = $this->redis->get($normalized);
+
+        return is_string($owner) && '' !== $owner ? $owner : $transactionId;
     }
 
     /**
-     * @throws InvalidArgumentException
+     * Drops the claim, so a key whose command never reached Kafka does not point at a transaction
+     * that will never exist.
+     *
+     * @throws RedisException
      */
-    public function store(string $key, string $transactionId): void
+    public function release(string $key): void
     {
-        $item = $this->idempotencyCache->getItem($this->normalize($key));
-        $item->set($transactionId);
-        $this->idempotencyCache->save($item);
+        $this->redis->del($this->normalize($key));
     }
 
     private function normalize(string $key): string

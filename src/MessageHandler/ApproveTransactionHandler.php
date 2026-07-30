@@ -23,7 +23,7 @@ final readonly class ApproveTransactionHandler
     public function __invoke(ApproveTransaction $command): void
     {
         if (null !== $transaction = $this->repository->find($command->transactionId)) {
-            $this->transactions->approve($transaction);
+            $this->transactions->approve($transaction, $command->actor);
         }
     }
 }

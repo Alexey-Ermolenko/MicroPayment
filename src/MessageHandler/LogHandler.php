@@ -19,7 +19,7 @@ final readonly class LogHandler
     {
         $this->em->persist(
             new Log(
-                actor: 'system',
+                actor: $event->actor ?? 'system',
                 action: $event->name(),
                 entityType: 'Transaction',
                 entityId: $event->transactionId,

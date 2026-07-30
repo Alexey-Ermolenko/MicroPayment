@@ -29,9 +29,10 @@ final class AuthController extends AbstractController
             return $this->json(['error' => 'Email already registered.'], 409);
         }
 
+        // Registration always creates a plain user: ROLE_ADMIN is seeded by migration, never self-assigned.
         $user = new User($request->email);
         $user->setPassword($hasher->hashPassword($user, $request->password));
-        $user->setRoles('ROLE_ADMIN' === $request->role ? ['ROLE_ADMIN'] : ['ROLE_USER']);
+        $user->setRoles(['ROLE_USER']);
         $em->persist($user);
         $em->flush();
 

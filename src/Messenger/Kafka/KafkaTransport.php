@@ -2,8 +2,10 @@
 
 namespace App\Messenger\Kafka;
 
+use JsonException;
 use RdKafka\Conf;
 use RdKafka\KafkaConsumer;
+use RdKafka\Message;
 use RdKafka\Producer;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
@@ -29,7 +31,7 @@ final class KafkaTransport implements TransportInterface
         $message = $this->consumer()->consume(1000);
 
         return match ($message->err) {
-            RD_KAFKA_RESP_ERR_NO_ERROR => [$this->decode($message->payload)],
+            RD_KAFKA_RESP_ERR_NO_ERROR => [$this->envelope($message)],
             RD_KAFKA_RESP_ERR__PARTITION_EOF,
             RD_KAFKA_RESP_ERR__TIMED_OUT,
             RD_KAFKA_RESP_ERR__TRANSPORT,
@@ -38,14 +40,16 @@ final class KafkaTransport implements TransportInterface
         };
     }
 
+    /** The handler succeeded: only now is it safe to move the offset past this message. */
     public function ack(Envelope $envelope): void
     {
-        // Offsets are auto-committed by the consumer configuration.
+        $this->commit($envelope);
     }
 
+    /** Messenger exhausted the retries and moved the message to the failure transport, so the offset can advance. */
     public function reject(Envelope $envelope): void
     {
-        // Offsets are auto-committed; rejected messages are not redelivered.
+        $this->commit($envelope);
     }
 
     public function send(Envelope $envelope): Envelope
@@ -65,6 +69,27 @@ final class KafkaTransport implements TransportInterface
         }
 
         return $envelope;
+    }
+
+    private function envelope(Message $message): Envelope
+    {
+        try {
+            $envelope = $this->decode((string) $message->payload);
+        } catch (MessageDecodingFailedException|JsonException $e) {
+            // A payload that cannot be decoded will never succeed: commit it, otherwise it blocks the partition forever.
+            $this->consumer()->commit($message);
+
+            throw $e;
+        }
+
+        return $envelope->with(new KafkaMessageStamp($message));
+    }
+
+    private function commit(Envelope $envelope): void
+    {
+        if (null !== $stamp = $envelope->last(KafkaMessageStamp::class)) {
+            $this->consumer()->commit($stamp->message);
+        }
     }
 
     private function decode(string $payload): Envelope
@@ -99,7 +124,8 @@ final class KafkaTransport implements TransportInterface
             $conf->set('metadata.broker.list', $this->brokers);
             $conf->set('group.id', $this->consumerGroup);
             $conf->set('auto.offset.reset', $this->offsetReset);
-            $conf->set('enable.auto.commit', 'true');
+            // Offsets are committed by ack()/reject() so an unhandled message stays available after a worker crash.
+            $conf->set('enable.auto.commit', 'false');
             $conf->set('enable.partition.eof', 'true');
             $this->consumer = new KafkaConsumer($conf);
             $this->consumer->subscribe([$this->topic]);

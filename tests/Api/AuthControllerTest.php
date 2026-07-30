@@ -37,6 +37,19 @@ final class AuthControllerTest extends WebTestCase
     /**
      * @throws JsonException
      */
+    public function testRegisterCannotGrantAdminRole(): void
+    {
+        $email = 'wannabe-admin@example.com';
+
+        $this->send('POST', '/api/v1/register', ['email' => $email, 'password' => 'secret123', 'role' => 'ROLE_ADMIN']);
+        $token = $this->send('POST', '/api/v1/login', ['email' => $email, 'password' => 'secret123'])['token'];
+
+        self::assertSame(['ROLE_USER'], $this->send('GET', '/api/v1/profile', token: $token)['roles']);
+    }
+
+    /**
+     * @throws JsonException
+     */
     public function testUnauthenticatedRequestIsRejected(): void
     {
         $response = $this->send('GET', '/api/v1/profile');

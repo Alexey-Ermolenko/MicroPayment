@@ -6,6 +6,7 @@ final readonly class ApproveTransaction implements Command
 {
     public function __construct(
         public string $transactionId,
+        public ?string $actor = null,
     ) {
     }
 }

@@ -9,6 +9,8 @@
 parameters:
     # Transactions left in PENDING longer than this are blocked automatically.
     app.pending_expire_after: '-3 days'
+    # How long an Idempotency-Key claim is kept in Redis (3 days).
+    app.idempotency_ttl: 259200
 
 services:
     # default configuration for services in *this* file
@@ -17,11 +19,18 @@ services:
         autoconfigure: true # Automatically registers your services as commands, event subscribers, etc.
         bind:
             string $expireAfter: '%app.pending_expire_after%'
+            int $idempotencyTtl: '%app.idempotency_ttl%'
 
     # makes classes in src/ available to be used as services
     # this creates a service per class whose id is the fully-qualified class name
     App\:
         resource: '../src/'
+
+    # Raw Redis connection: IdempotencyService needs SET NX, which the PSR-6 cache cannot express.
+    Redis:
+        class: Redis
+        factory: ['Symfony\Component\Cache\Adapter\RedisAdapter', 'createConnection']
+        arguments: ['%env(REDIS_DSN)%']
 
     # add more service definitions when explicit configuration is needed
     # please note that last definitions always *replace* previous ones

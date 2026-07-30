@@ -100,19 +100,32 @@ final class TransactionServiceTest extends KernelTestCase
         $transfer = $this->create(TransactionType::TRANSFER, 4000, sender: $sender, recipient: $recipient);
         $this->service->approve($transfer);
 
-        $refund = $this->service->create(new CreateTransaction(
-            transactionId: (string) Uuid::v4(),
-            type: TransactionType::REFUND->value,
-            amount: 0,
-            currency: 'USD',
-            refundedTransactionId: (string) $transfer->getId(),
-        ));
+        $refund = $this->refund($transfer);
         $this->service->approve($refund);
 
         self::assertSame(TransactionType::REFUND, $refund->getType());
         self::assertSame(TransactionStatus::APPROVED, $refund->getStatus());
         self::assertSame(10000, $sender->getBalance());
         self::assertSame(0, $recipient->getBalance());
+    }
+
+    /**
+     * @throws Throwable
+     */
+    public function testApproveRecordsActorInAuditLog(): void
+    {
+        $wallet = $this->makeWallet();
+        $actor = (string) $wallet->getUser()->getId();
+
+        $tx = $this->create(TransactionType::DEPOSIT, 1000, recipient: $wallet);
+        $this->service->approve($tx, $actor);
+
+        $logged = $this->em->getConnection()->fetchOne(
+            "SELECT actor FROM logs WHERE entity_id = ? AND action = 'TransactionApproved'",
+            [(string) $tx->getId()],
+        );
+
+        self::assertSame($actor, $logged);
     }
 
     public function testBlockLeavesBalanceUntouched(): void
@@ -135,6 +148,17 @@ final class TransactionServiceTest extends KernelTestCase
             currency: 'USD',
             senderWalletId: null !== $sender ? (string) $sender->getId() : null,
             recipientWalletId: null !== $recipient ? (string) $recipient->getId() : null,
+        ));
+    }
+
+    private function refund(Transaction $original): Transaction
+    {
+        return $this->service->create(new CreateTransaction(
+            transactionId: (string) Uuid::v4(),
+            type: TransactionType::REFUND->value,
+            amount: 0,
+            currency: $original->getCurrency(),
+            refundedTransactionId: (string) $original->getId(),
         ));
     }
 

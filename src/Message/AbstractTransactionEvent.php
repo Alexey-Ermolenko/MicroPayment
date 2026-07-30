@@ -12,6 +12,7 @@ abstract class AbstractTransactionEvent implements DomainEvent
         public readonly ?string $senderUserId = null,
         public readonly ?string $recipientUserId = null,
         public readonly ?string $reason = null,
+        public readonly ?string $actor = null,
     ) {
     }
 
@@ -25,6 +26,7 @@ abstract class AbstractTransactionEvent implements DomainEvent
             'senderUserId' => $this->senderUserId,
             'recipientUserId' => $this->recipientUserId,
             'reason' => $this->reason,
+            'actor' => $this->actor,
         ];
     }
 }

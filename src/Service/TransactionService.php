@@ -77,7 +77,7 @@ final readonly class TransactionService
     /**
      * @throws Throwable
      */
-    public function approve(Transaction $transaction): Transaction
+    public function approve(Transaction $transaction, ?string $actor = null): Transaction
     {
         $this->assertPending($transaction, 'approve');
 
@@ -102,11 +102,13 @@ final readonly class TransactionService
 
                 $transaction->setStatus(TransactionStatus::APPROVED);
             });
-        } catch (Throwable $e) {
-            return $this->markFailed($transaction->getId(), $e->getMessage());
+        } catch (InsufficientFundsException $e) {
+            // Only a business rejection settles as FAILED. Infrastructure errors (deadlock, lock timeout,
+            // lost connection) propagate so Messenger retries the command instead of losing the money move.
+            return $this->markFailed($transaction->getId(), $e->getMessage(), $actor);
         }
 
-        $this->eventBus->dispatch($this->event(TransactionApproved::class, $transaction));
+        $this->eventBus->dispatch($this->event(TransactionApproved::class, $transaction, actor: $actor));
 
         return $transaction;
     }
@@ -114,14 +116,14 @@ final readonly class TransactionService
     /**
      * @throws ExceptionInterface
      */
-    public function block(Transaction $transaction): Transaction
+    public function block(Transaction $transaction, ?string $actor = null): Transaction
     {
         $this->assertPending($transaction, 'block');
 
         $transaction->setStatus(TransactionStatus::BLOCKED);
         $this->em->flush();
 
-        $this->eventBus->dispatch($this->event(TransactionBlocked::class, $transaction));
+        $this->eventBus->dispatch($this->event(TransactionBlocked::class, $transaction, actor: $actor));
 
         return $transaction;
     }
@@ -131,7 +133,7 @@ final readonly class TransactionService
      *
      * @throws ExceptionInterface
      */
-    private function markFailed(Uuid $id, string $reason): Transaction
+    private function markFailed(Uuid $id, string $reason, ?string $actor = null): Transaction
     {
         $this->registry->resetManager();
         /** @var EntityManagerInterface $em */
@@ -142,7 +144,7 @@ final readonly class TransactionService
         $transaction->setStatus(TransactionStatus::FAILED);
         $em->flush();
 
-        $this->eventBus->dispatch($this->event(TransactionFailed::class, $transaction, $reason));
+        $this->eventBus->dispatch($this->event(TransactionFailed::class, $transaction, $reason, $actor));
 
         return $transaction;
     }
@@ -157,7 +159,7 @@ final readonly class TransactionService
     /**
      * @param class-string<AbstractTransactionEvent> $class
      */
-    private function event(string $class, Transaction $transaction, ?string $reason = null): AbstractTransactionEvent
+    private function event(string $class, Transaction $transaction, ?string $reason = null, ?string $actor = null): AbstractTransactionEvent
     {
         return new $class(
             (string) $transaction->getId(),
@@ -167,6 +169,7 @@ final readonly class TransactionService
             $this->userId($transaction->getSenderWallet()),
             $this->userId($transaction->getRecipientWallet()),
             $reason,
+            $actor,
         );
     }
 

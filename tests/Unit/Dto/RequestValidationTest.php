@@ -36,12 +36,11 @@ final class RequestValidationTest extends TestCase
 
     public function testRegisterRequestValidation(): void
     {
-        $invalid = $this->validator->validate(new RegisterRequest('nope', '123', 'ROLE_ROOT'));
+        $invalid = $this->validator->validate(new RegisterRequest('nope', '123'));
         self::assertViolation($invalid, 'email');
         self::assertViolation($invalid, 'password');
-        self::assertViolation($invalid, 'role');
 
-        self::assertCount(0, $this->validator->validate(new RegisterRequest('user@example.com', 'secret123', 'ROLE_ADMIN')));
+        self::assertCount(0, $this->validator->validate(new RegisterRequest('user@example.com', 'secret123')));
     }
 
     private static function assertViolation(iterable $violations, string $property): void
